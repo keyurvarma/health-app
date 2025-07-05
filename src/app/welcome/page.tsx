@@ -1,7 +1,7 @@
 'use client';
 
 import React, { useState, useCallback, useEffect } from 'react';
-import { Mic } from 'lucide-react';
+import { Mic, Flag } from 'lucide-react';
 import { Button } from "@/components/ui/button";
 import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle, AlertDialogTrigger } from "@/components/ui/alert-dialog";
 import { Calendar } from "@/components/ui/calendar";
@@ -10,7 +10,7 @@ import { cn } from "@/lib/utils";
 import { format } from "date-fns";
 import { toast } from "@/hooks/use-toast";
 import { auth, db } from "@/firebase/config";
-import { doc, collection, getDocs, query, where, getDoc, addDoc, updateDoc } from "firebase/firestore";
+import { doc, collection, getDocs, query, where, getDoc, addDoc, updateDoc, Timestamp } from "firebase/firestore";
 import axios from "axios";
 import path from "path";
 import fs from 'fs';
@@ -18,12 +18,14 @@ import fs from 'fs';
 import FormData from "form-data";
 
 interface Appointment {
+  id?: string;
   appointmentDate: string;
   appointmentTime: string;
   assignedDoctor: string;
   patientUsername: string;
   diagnosis?: string;
   medication?: string;
+  scheduledDate?: Date | Timestamp | null;
 }
 
 interface AppointmentRequest {
@@ -34,14 +36,23 @@ interface AppointmentRequest {
   diagnosis: string;
   medication?: string;
   status: 'pending' | 'scheduled' | 'completed';
-  createdAt: Date | FirebaseFirestore.Timestamp;
-  scheduledDate?: Date | FirebaseFirestore.Timestamp | null;
+  createdAt: Date | Timestamp;
+  scheduledDate?: Date | Timestamp | null;
   scheduledTime?: string;
+  flaggedForReview?: boolean;
+  resubmissionComment?: string;
 }
 
 const audioRecordingOptions = {
   audio: true,
   video: false
+}
+
+function toDateSafe(date: Date | Timestamp | null | undefined): Date | null {
+  if (!date) return null;
+  if (date instanceof Date) return date;
+  if (typeof date === 'object' && 'toDate' in date && typeof date.toDate === 'function') return date.toDate();
+  return null;
 }
 
 function PatientWelcomePage() {
@@ -342,33 +353,32 @@ function PatientWelcomePage() {
   }, [audioData]);
 
   // Fetch patient's appointment requests
+  const fetchAppointmentRequests = async () => {
+    const user = auth.currentUser;
+    if (!user) return;
+    try {
+      const q = query(
+        collection(db, 'appointmentRequests'),
+        where('patientId', '==', user.uid)
+      );
+      const querySnapshot = await getDocs(q);
+      const requests = querySnapshot.docs.map(doc => {
+        const data = doc.data();
+        // Convert Firestore timestamp to Date object
+        return {
+          ...data,
+          id: doc.id,
+          createdAt: data.createdAt?.toDate ? data.createdAt.toDate() : data.createdAt || new Date(),
+          scheduledDate: data.scheduledDate?.toDate ? data.scheduledDate.toDate() : data.scheduledDate || null,
+        };
+      }) as AppointmentRequest[];
+      setAppointmentRequests(requests);
+    } catch (error) {
+      console.error("Error fetching appointment requests:", error);
+    }
+  };
+
   useEffect(() => {
-    const fetchAppointmentRequests = async () => {
-      const user = auth.currentUser;
-      if (!user) return;
-
-      try {
-        const q = query(
-          collection(db, 'appointmentRequests'),
-          where('patientId', '==', user.uid)
-        );
-        const querySnapshot = await getDocs(q);
-        const requests = querySnapshot.docs.map(doc => {
-          const data = doc.data();
-          // Convert Firestore timestamp to Date object
-          return {
-            ...data,
-            id: doc.id,
-            createdAt: data.createdAt?.toDate() || new Date(),
-            scheduledDate: data.scheduledDate?.toDate() || null,
-          };
-        }) as AppointmentRequest[];
-        setAppointmentRequests(requests);
-      } catch (error) {
-        console.error("Error fetching appointment requests:", error);
-      }
-    };
-
     fetchAppointmentRequests();
   }, []);
 
@@ -455,11 +465,15 @@ function PatientWelcomePage() {
                 {request.medication && (
                   <p><strong>Medication:</strong> {request.medication}</p>
                 )}
-                {request.scheduledDate && (
-                  <p><strong>Scheduled Date:</strong> {format(request.scheduledDate, 'PPP')}</p>
+                {request.scheduledDate && toDateSafe(request.scheduledDate) && (
+                  <p><strong>Scheduled Date:</strong> {format(toDateSafe(request.scheduledDate)!, 'PPP')}</p>
                 )}
                 {request.scheduledTime && (
                   <p><strong>Scheduled Time:</strong> {request.scheduledTime}</p>
+                )}
+                {/* Flagged for review prompt */}
+                {request.flaggedForReview && request.status === 'pending' && (
+                  <FlaggedReviewResubmission request={request} onResubmitted={fetchAppointmentRequests} />
                 )}
               </div>
             ))}
@@ -498,7 +512,9 @@ const DoctorWelcomePage = () => {
             scheduledDate: data.scheduledDate?.toDate() || null,
           };
         }) as AppointmentRequest[];
-        setAppointmentRequests(requests);
+        // Filter out flagged requests as they are pending patient review
+        const nonFlaggedRequests = requests.filter(request => !request.flaggedForReview);
+        setAppointmentRequests(nonFlaggedRequests);
       } catch (error) {
         console.error("Error fetching appointment requests:", error);
         toast({
@@ -521,10 +537,20 @@ const DoctorWelcomePage = () => {
           where('assignedDoctor', '==', currentDoctor)
         );
         const querySnapshot = await getDocs(q);
-        const appointments = querySnapshot.docs.map(doc => ({
-          ...doc.data(),
-          id: doc.id,
-        })) as Appointment[];
+        const appointments = querySnapshot.docs.map(doc => {
+          const data = doc.data();
+          return {
+            ...data,
+            id: doc.id,
+            appointmentDate: data.appointmentDate,
+            appointmentTime: data.appointmentTime,
+            assignedDoctor: data.assignedDoctor,
+            patientUsername: data.patientUsername,
+            diagnosis: data.diagnosis,
+            medication: data.medication,
+            // Add more fields as needed
+          };
+        }) as Appointment[];
 
         // Sort appointments by date and time
         appointments.sort((a, b) => {
@@ -618,13 +644,45 @@ const DoctorWelcomePage = () => {
         ...doc.data(),
         id: doc.id,
       })) as AppointmentRequest[];
-      setAppointmentRequests(requests);
+      // Filter out flagged requests as they are pending patient review
+      const nonFlaggedRequests = requests.filter(request => !request.flaggedForReview);
+      setAppointmentRequests(nonFlaggedRequests);
 
     } catch (error) {
       console.error("Error scheduling appointment:", error);
       toast({
         title: "Error",
         description: "Failed to schedule appointment.",
+      });
+    }
+  };
+
+  const handleFlagForReview = async (request: AppointmentRequest) => {
+    try {
+      const requestRef = doc(db, 'appointmentRequests', request.id!);
+      await updateDoc(requestRef, { flaggedForReview: true });
+      toast({
+        title: "Flagged for Review",
+        description: `Patient ${request.patientUsername} has been flagged for review.`,
+      });
+      // Refresh appointment requests
+      const q = query(
+        collection(db, 'appointmentRequests'),
+        where('status', '==', 'pending')
+      );
+      const querySnapshot = await getDocs(q);
+      const requests = querySnapshot.docs.map(doc => ({
+        ...doc.data(),
+        id: doc.id,
+      })) as AppointmentRequest[];
+      // Filter out flagged requests as they are pending patient review
+      const nonFlaggedRequests = requests.filter(request => !request.flaggedForReview);
+      setAppointmentRequests(nonFlaggedRequests);
+    } catch (error) {
+      console.error("Error flagging for review:", error);
+      toast({
+        title: "Error",
+        description: "Failed to flag for review.",
       });
     }
   };
@@ -645,7 +703,7 @@ const DoctorWelcomePage = () => {
                 <div className="mb-4">
                   <h3 className="font-semibold text-lg">{request.patientUsername}</h3>
                   <p className="text-sm text-gray-500">
-                    Requested on: {format(request.createdAt, 'PPP')}
+                    Requested on: {format(toDateSafe(request.createdAt) || new Date(), 'PPP')}
                   </p>
                 </div>
                 <div className="space-y-2">
@@ -653,12 +711,25 @@ const DoctorWelcomePage = () => {
                     <h4 className="font-medium">AI Diagnosis:</h4>
                     <p className="text-sm">{request.diagnosis}</p>
                   </div>
+                  {request.resubmissionComment && (
+                    <div className="mt-2 p-2 bg-yellow-50 border-l-4 border-yellow-400 rounded">
+                      <p className="text-xs text-yellow-800"><strong>Patient Comment:</strong> {request.resubmissionComment}</p>
+                    </div>
+                  )}
                 </div>
                 <Button 
                   className="mt-4 w-full"
                   onClick={() => handleScheduleAppointment(request)}
                 >
                   Schedule Appointment
+                </Button>
+                <Button 
+                  className="mt-2 w-full"
+                  variant="destructive"
+                  onClick={() => handleFlagForReview(request)}
+                >
+                  <Flag className="h-4 w-4 mr-2" />
+                  Flag for review
                 </Button>
               </div>
             ))}
@@ -678,12 +749,21 @@ const DoctorWelcomePage = () => {
                 <div className="mb-4">
                   <h3 className="font-semibold text-lg">{appointment.patientUsername}</h3>
                   <div className="mt-2 space-y-1">
-                    <p className="text-sm">
-                      <strong>Date:</strong> {appointment.appointmentDate}
-                    </p>
-                    <p className="text-sm">
-                      <strong>Time:</strong> {appointment.appointmentTime}
-                    </p>
+                    {appointment.appointmentDate && (
+                      <p className="text-sm">
+                        <strong>Date:</strong> {typeof appointment.appointmentDate === 'string' ? appointment.appointmentDate : (toDateSafe(appointment.appointmentDate) ? format(toDateSafe(appointment.appointmentDate)!, 'PPP') : '')}
+                      </p>
+                    )}
+                    {appointment.appointmentTime && (
+                      <p className="text-sm">
+                        <strong>Time:</strong> {appointment.appointmentTime}
+                      </p>
+                    )}
+                    {appointment.scheduledDate && toDateSafe(appointment.scheduledDate) && (
+                      <p className="text-sm">
+                        <strong>Scheduled Date:</strong> {format(toDateSafe(appointment.scheduledDate)!, 'PPP')}
+                      </p>
+                    )}
                   </div>
                 </div>
                 <div className="space-y-2">
@@ -715,8 +795,8 @@ const DoctorWelcomePage = () => {
             <div className="mb-4">
               <Calendar
                 mode="single"
-                selected={date}
-                onSelect={setDate}
+                selected={date ?? undefined}
+                onSelect={d => setDate(d ?? null)}
                 disabled={d => d < new Date()}
                 initialFocus
               />
@@ -777,6 +857,63 @@ const DoctorWelcomePage = () => {
     </div>
   );
 };
+
+function FlaggedReviewResubmission({ request, onResubmitted }: { request: AppointmentRequest, onResubmitted: () => void }) {
+  const [symptoms, setSymptoms] = useState(request.symptoms || '');
+  const [comment, setComment] = useState('');
+  const [loading, setLoading] = useState(false);
+
+  const handleResubmit = async () => {
+    setLoading(true);
+    try {
+      const requestRef = doc(db, 'appointmentRequests', request.id!);
+      await updateDoc(requestRef, {
+        symptoms,
+        flaggedForReview: false,
+        resubmissionComment: comment,
+      });
+      toast({
+        title: 'Resubmitted',
+        description: 'Your symptoms have been resubmitted for review.',
+      });
+      onResubmitted();
+    } catch (error) {
+      toast({
+        title: 'Error',
+        description: 'Failed to resubmit symptoms.',
+      });
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="mt-4 p-4 border border-yellow-400 bg-yellow-50 rounded">
+      <p className="font-semibold text-yellow-800 mb-2">Your symptoms have been flagged for review. Please check and resubmit with comments.</p>
+      <div className="mb-2">
+        <label className="block text-sm font-medium mb-1">Symptoms</label>
+        <textarea
+          className="w-full border rounded p-2 text-sm"
+          rows={3}
+          value={symptoms}
+          onChange={e => setSymptoms(e.target.value)}
+        />
+      </div>
+      <div className="mb-2">
+        <label className="block text-sm font-medium mb-1">Comments (optional)</label>
+        <textarea
+          className="w-full border rounded p-2 text-sm"
+          rows={2}
+          value={comment}
+          onChange={e => setComment(e.target.value)}
+        />
+      </div>
+      <Button className="mt-2" onClick={handleResubmit} disabled={loading || !symptoms.trim()}>
+        {loading ? 'Resubmitting...' : 'Resubmit Symptoms'}
+      </Button>
+    </div>
+  );
+}
 
 export default function WelcomePage() {
   const [userType, setUserType] = useState<string | null>(null);
